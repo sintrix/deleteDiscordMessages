@@ -351,8 +351,72 @@
 
                 return await recurse();
             } else {
-                if (total - offset > 0) log.warn('Ended because API returned an empty page.');
-                return end();
+                for (let i = 0; i < messagesToDelete.length; i++) {
+                    const message = messagesToDelete[i];
+                    if (stopHndl && stopHndl()===false) return end(log.error('Stopped by you!'));
+
+                    log.debug(`${((delCount + 1) / grandTotal * 100).toFixed(2)}% (${delCount + 1}/${grandTotal})`,
+                        `Deleting ID:${redact(message.id)} <b>${redact(message.author.username+'#'+message.author.discriminator)} <small>(${redact(new Date(message.timestamp).toLocaleString())})</small>:</b> <i>${redact(message.content).replace(/\n/g,'↵')}</i>`,
+                        message.attachments.length ? redact(JSON.stringify(message.attachments)) : '');
+                    if (onProgress) onProgress(delCount + 1, grandTotal);
+                    
+                    let resp;
+                    try {
+                        const s = Date.now();
+                        const API_DELETE_URL = `https://discord.com/api/v6/channels/${message.channel_id}/messages/${message.id}`;
+                        resp = await fetch(API_DELETE_URL, {
+                            headers,
+                            method: 'DELETE'
+                        });
+                        lastPing = (Date.now() - s);
+                        avgPing = (avgPing*0.9) + (lastPing*0.1);
+                        delCount++;
+                    } catch (err) {
+                        log.error('Delete request throwed an error:', err);
+                        log.verb('Related object:', redact(JSON.stringify(message)));
+                        failCount++;
+                    }
+
+                    if (!resp.ok) {
+                        // deleting messages too fast
+                        if (resp.status === 429) {
+                            const w = (await resp.json()).retry_after;
+                            throttledCount++;
+                            throttledTotalTime += w;
+                            baseDeleteDelay = deleteDelay;
+                            deleteDelay = w > baseDeleteDelay ? w : baseDeleteDelay;
+                            log.warn(`Being rate limited by the API for ${w}ms! Increasing delete delay to ${deleteDelay}ms, adjusting base delete delay to ${baseDeleteDelay}ms`);
+                            printDelayStats();
+                            log.verb(`Cooling down for ${w*2}ms before retrying...`);
+                            await wait(w*2);
+                            i--; // retry
+                        } else {
+                            log.error(`Error deleting message, API responded with status ${resp.status}!`, await resp.json());
+                            log.verb('Related object:', redact(JSON.stringify(message)));
+                            failCount++;
+                        }
+                    }
+                    else if (deleteDelay - baseDeleteDelay > delayAdjustmentThreshold)
+                    {
+                        deleteDelay = baseDeleteDelay + (deleteDelay - baseDeleteDelay) * delayReductionGeometricFactor;
+                        log.verb(`Delete delay lowered to ${deleteDelay}ms`);
+                    }
+                    
+                    await wait(deleteDelay);
+                }
+
+                if (skippedMessages.length > 0) {
+                    grandTotal -= skippedMessages.length;
+                    offset += skippedMessages.length;
+                    log.verb(`Found ${skippedMessages.length} system messages! Decreasing grandTotal to ${grandTotal} and increasing offset to ${offset}.`);
+                }
+                
+                log.verb(`Searching next messages in ${searchDelay}ms...`, (offset ? `(offset: ${offset})` : '') );
+                await wait(searchDelay);
+
+                if (stopHndl && stopHndl()===false) return end(log.error('Stopped by you!'));
+
+                return await recurse();
             }
         }
 
